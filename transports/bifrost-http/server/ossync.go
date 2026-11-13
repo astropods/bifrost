@@ -21,6 +21,7 @@ package server
 //     in-memory copy, covering lost notifications and listener downtime.
 //   - A reconcile loop compares in-memory virtual key IDs with the table and
 //     drops keys that were deleted while a notification was missed.
+//   - Health is exported as bifrost_ossync_* Prometheus metrics on /metrics.
 //
 // Nothing here is on the request path: if the listener or the loops fail, the
 // node keeps serving from memory exactly as upstream OSS does.
@@ -46,7 +47,9 @@ import (
 	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/postgresconn"
 	"github.com/maximhq/bifrost/plugins/governance"
-	"github.com/valyala/fasthttp"
+	"github.com/maximhq/bifrost/plugins/telemetry"
+	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
+	"github.com/prometheus/client_golang/prometheus"
 	"gorm.io/gorm"
 )
 
@@ -149,6 +152,7 @@ func (o *OSSync) Start(ctx context.Context) {
 		go o.listenLoop(ctx)
 		go o.every(ctx, o.catchupEvery, o.catchup)
 		go o.every(ctx, o.reconcileEvery, o.reconcile)
+		go o.registerMetricsLoop(ctx)
 	})
 }
 
@@ -520,36 +524,117 @@ func (o *OSSync) governanceStore() (governance.GovernanceStore, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Status endpoint
+// Prometheus metrics
+//
+// Served on Bifrost's existing /metrics (the telemetry plugin's registry), so
+// they follow its enable switch and auth, and reach its push gateway. The
+// collector reads the live counters at scrape time; nothing is duplicated.
+//
+// Suggested alerts:
+//   bifrost_ossync_listener_connected == 0 for 30s   -> node is not hearing peers
+//   rate(bifrost_ossync_catchup_reloads_total[15m]) > 0 -> notifications are being lost
 
-// Status is served at GET /api/ossync/status.
-func (o *OSSync) Status() map[string]any {
-	last := o.stats.LastAppliedUnix.Load()
-	var lastApplied any
-	if last > 0 {
-		lastApplied = time.Unix(last, 0).UTC().Format(time.RFC3339)
+type ossyncMetric struct {
+	desc  *prometheus.Desc
+	kind  prometheus.ValueType
+	value func(o *OSSync) float64
+}
+
+func boolMetric(b *atomic.Bool) float64 {
+	if b.Load() {
+		return 1
 	}
-	return map[string]any{
-		"node":              o.nodeID,
-		"listening":         o.listening.Load(),
-		"verified":          o.verified.Load(),
-		"published":         o.stats.Published.Load(),
-		"publish_errors":    o.stats.PublishErrors.Load(),
-		"received":          o.stats.Received.Load(),
-		"applied":           o.stats.Applied.Load(),
-		"apply_errors":      o.stats.ApplyErrors.Load(),
-		"catchup_reloads":   o.stats.CatchupReloads.Load(),
-		"reconcile_removes": o.stats.ReconcileRemoves.Load(),
-		"reconcile_reloads": o.stats.ReconcileReloads.Load(),
-		"listener_drops":    o.stats.ListenerDrops.Load(),
-		"last_applied_at":   lastApplied,
+	return 0
+}
+
+// ossyncCollector implements prometheus.Collector over an OSSync's counters.
+type ossyncCollector struct {
+	o       *OSSync
+	metrics []ossyncMetric
+}
+
+func newOSSyncCollector(o *OSSync) *ossyncCollector {
+	labels := prometheus.Labels{"node": o.nodeID}
+	m := func(name, help string, kind prometheus.ValueType, value func(o *OSSync) float64) ossyncMetric {
+		return ossyncMetric{desc: prometheus.NewDesc("bifrost_ossync_"+name, help, nil, labels), kind: kind, value: value}
+	}
+	gauge, counter := prometheus.GaugeValue, prometheus.CounterValue
+	return &ossyncCollector{o: o, metrics: []ossyncMetric{
+		m("listener_connected", "1 while this node's LISTEN connection is up.", gauge,
+			func(o *OSSync) float64 { return boolMetric(&o.listening) }),
+		m("listener_verified", "1 once this node has received its own NOTIFY ping on the current connection.", gauge,
+			func(o *OSSync) float64 { return boolMetric(&o.verified) }),
+		m("listener_drops_total", "LISTEN connections lost and retried.", counter,
+			func(o *OSSync) float64 { return float64(o.stats.ListenerDrops.Load()) }),
+		m("messages_published_total", "Change notifications this node sent.", counter,
+			func(o *OSSync) float64 { return float64(o.stats.Published.Load()) }),
+		m("publish_errors_total", "Change notifications that failed to send (peers converge via catch-up).", counter,
+			func(o *OSSync) float64 { return float64(o.stats.PublishErrors.Load()) }),
+		m("messages_received_total", "Change notifications received from other nodes.", counter,
+			func(o *OSSync) float64 { return float64(o.stats.Received.Load()) }),
+		m("messages_applied_total", "Received notifications applied to memory.", counter,
+			func(o *OSSync) float64 { return float64(o.stats.Applied.Load()) }),
+		m("apply_errors_total", "Received notifications that failed to apply (retried by catch-up).", counter,
+			func(o *OSSync) float64 { return float64(o.stats.ApplyErrors.Load()) }),
+		m("catchup_reloads_total", "Virtual keys reloaded by catch-up because a notification was missed.", counter,
+			func(o *OSSync) float64 { return float64(o.stats.CatchupReloads.Load()) }),
+		m("reconcile_removes_total", "Virtual keys removed by reconcile because their delete was missed.", counter,
+			func(o *OSSync) float64 { return float64(o.stats.ReconcileRemoves.Load()) }),
+		m("reconcile_reloads_total", "Virtual keys loaded by reconcile because this node had never seen them.", counter,
+			func(o *OSSync) float64 { return float64(o.stats.ReconcileReloads.Load()) }),
+		m("last_applied_timestamp_seconds", "Unix time of the last notification applied from another node (0 if none).", gauge,
+			func(o *OSSync) float64 { return float64(o.stats.LastAppliedUnix.Load()) }),
+	}}
+}
+
+func (c *ossyncCollector) Describe(ch chan<- *prometheus.Desc) {
+	for _, m := range c.metrics {
+		ch <- m.desc
 	}
 }
 
-func (o *OSSync) statusHandler(ctx *fasthttp.RequestCtx) {
-	body, _ := json.Marshal(o.Status())
-	ctx.SetContentType("application/json")
-	ctx.SetBody(body)
+func (c *ossyncCollector) Collect(ch chan<- prometheus.Metric) {
+	for _, m := range c.metrics {
+		ch <- prometheus.MustNewConstMetric(m.desc, m.kind, m.value(c.o))
+	}
+}
+
+// registerMetricsLoop registers the collector with the telemetry plugin's
+// registry, and again whenever the plugin is reloaded with a fresh registry.
+// Without the telemetry plugin there is no /metrics, and this does nothing.
+func (o *OSSync) registerMetricsLoop(ctx context.Context) {
+	collector := newOSSyncCollector(o)
+	var current *prometheus.Registry
+	try := func() {
+		plugin, err := lib.FindPluginAs[*telemetry.PrometheusPlugin](o.s.Config, telemetry.PluginName)
+		if err != nil || plugin == nil {
+			return
+		}
+		reg := plugin.GetRegistry()
+		if reg == nil || reg == current {
+			return
+		}
+		if err := reg.Register(collector); err != nil {
+			var already prometheus.AlreadyRegisteredError
+			if !errors.As(err, &already) {
+				logger.Warn("ossync: register metrics: %v", err)
+				return
+			}
+		}
+		current = reg
+		logger.Info("ossync: metrics registered on /metrics")
+	}
+	try()
+	t := time.NewTicker(10 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			try()
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

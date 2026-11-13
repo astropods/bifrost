@@ -3799,7 +3799,6 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 	if ossync := newOSSyncFromEnv(s); ossync != nil {
 		callbacks = ossync.Wrap()
 		ossync.Start(s.Ctx)
-		s.Router.GET("/api/ossync/status", ossync.statusHandler)
 	}
 	err = s.RegisterAPIRoutes(s.Ctx, callbacks, apiMiddlewares...)
 	if err != nil {
