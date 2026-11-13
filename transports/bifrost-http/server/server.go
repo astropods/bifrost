@@ -3793,8 +3793,15 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 		return err
 	}
 
-	// Register routes
-	err = s.RegisterAPIRoutes(s.Ctx, s, apiMiddlewares...)
+	// Register routes. With BIFROST_OSS_SYNC=1 the governance callbacks are
+	// wrapped so changes made on this node reach every other node (ossync.go).
+	var callbacks ServerCallbacks = s
+	if ossync := newOSSyncFromEnv(s); ossync != nil {
+		callbacks = ossync.Wrap()
+		ossync.Start(s.Ctx)
+		s.Router.GET("/api/ossync/status", ossync.statusHandler)
+	}
+	err = s.RegisterAPIRoutes(s.Ctx, callbacks, apiMiddlewares...)
 	if err != nil {
 		s.CloseAgentGateway()
 		if s.WSTicketStore != nil {
