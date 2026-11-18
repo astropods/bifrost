@@ -3975,13 +3975,19 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 		return err
 	}
 
-	// Register routes
+	// Register routes. With BIFROST_OSS_SYNC=1 the governance callbacks are
+	// wrapped so changes made on this node reach every other node (ossync.go).
 	// /v1/mcp takes the /api chain. Copied now: apiMiddlewares and
 	// inferenceMiddlewares grow from the same commonMiddlewares array, so an append
 	// to the inference chain below can overwrite an /api entry that fit in its
 	// spare capacity (AuthBypassedMiddleware, without a config store).
 	bifrostMCPMiddlewares := slices.Clone(apiMiddlewares)
-	err = s.RegisterAPIRoutes(s.Ctx, s, apiMiddlewares...)
+	var callbacks ServerCallbacks = s
+	ossync := newOSSyncFromEnv(s)
+	if ossync != nil {
+		callbacks = ossync.Wrap()
+	}
+	err = s.RegisterAPIRoutes(s.Ctx, callbacks, apiMiddlewares...)
 	if err != nil {
 		s.CloseAgentGateway()
 		if s.WSTicketStore != nil {
@@ -3994,6 +4000,11 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 		}
 		s.stopOAuth2Background()
 		return fmt.Errorf("failed to initialize routes: %v", err)
+	}
+	// Only once the routes exist: a failed bootstrap must not leave the listener
+	// running against a half-built server.
+	if ossync != nil {
+		ossync.Start(s.Ctx)
 	}
 	// Registering inference routes
 	// The pre-auth plugin phase runs immediately before the auth middlewares so a plugin can
