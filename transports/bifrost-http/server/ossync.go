@@ -1,27 +1,36 @@
 package server
 
-// OSS multi-node sync (proof of concept).
+// OSS multi-node sync for governance state.
 //
 // Bifrost OSS keeps governance entities (virtual keys, teams, customers, model
-// configs) in each process's memory and reads Postgres only at startup, so an
-// entity created through the API on one node is unknown to every other node
-// until it restarts. Enterprise solves this with gossip; this file does the
-// same job with Postgres LISTEN/NOTIFY, which every multi-node deployment
-// already has.
+// configs, budgets) in each process's memory and reads Postgres only at
+// startup, so an entity created through the API on one node is unknown to every
+// other node until it restarts. Enterprise solves this with gossip; this file
+// does the same job with Postgres LISTEN/NOTIFY, which every multi-node
+// deployment already has.
 //
 // How it works:
 //
 //   - ossyncCallbacks wraps the server's ServerCallbacks. After a local
-//     Reload*/Remove* succeeds it publishes {node, kind, op, ids} with
-//     pg_notify. Messages carry only IDs; peers re-read the row themselves, so
-//     duplicates and reordering are harmless (the database state always wins).
+//     Reload*/Remove* or budget reset succeeds it queues {node, kind, op, ids};
+//     one sender goroutine delivers the queue with pg_notify, so a slow database
+//     never holds up the admin request. Messages carry only IDs; peers re-read
+//     the row themselves, so duplicates and reordering are harmless (the
+//     database state always wins).
 //   - Every node holds one dedicated LISTEN connection and applies peers'
 //     messages by calling the same local, non-broadcasting methods.
-//   - A catch-up loop reloads virtual keys whose updated_at is newer than the
-//     in-memory copy, covering lost notifications and listener downtime.
-//   - A reconcile loop compares in-memory virtual key IDs with the table and
-//     drops keys that were deleted while a notification was missed.
+//   - Catch-up (every 5s) reloads entities whose row is newer than the
+//     in-memory copy. Its window reaches back to the moment the listener last
+//     dropped, so a long outage is repaired too, not only the last 2 minutes.
+//   - Reconcile (every 60s) compares every virtual key row with memory, reloads
+//     stale ones, and removes keys deleted since its previous pass.
+//   - Sweep (every 10m) compares all of memory with the database for virtual
+//     keys, teams, customers and model configs, and fixes anything left.
 //   - Health is exported as bifrost_ossync_* Prometheus metrics on /metrics.
+//
+// Not synced: provider configuration and keys (the providers handler edits the
+// in-memory config and client directly), virtual MCPs, and live budget and
+// rate-limit usage counters, which stay per node.
 //
 // Nothing here is on the request path: if the listener or the loops fail, the
 // node keeps serving from memory exactly as upstream OSS does.
@@ -48,6 +57,7 @@ import (
 	"github.com/maximhq/bifrost/framework/postgresconn"
 	"github.com/maximhq/bifrost/plugins/governance"
 	"github.com/maximhq/bifrost/plugins/telemetry"
+	"github.com/maximhq/bifrost/transports/v2/bifrost-http/handlers"
 	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
 	"github.com/prometheus/client_golang/prometheus"
 	"gorm.io/gorm"
@@ -58,14 +68,22 @@ const (
 	// Postgres caps a NOTIFY payload at 8000 bytes. A UUID costs ~40 bytes in
 	// JSON, so 150 IDs per message leaves ample headroom.
 	ossyncMaxIDsPerMessage = 150
+	// Messages waiting for the sender. A full queue drops the message (peers
+	// converge through catch-up) rather than block an admin request.
+	ossyncQueueSize = 4096
+	// Rows read per query by catch-up, reconcile and sweep.
+	ossyncPageSize = 1000
 
-	ossyncKindVirtualKey  = "virtual_key"
-	ossyncKindTeam        = "team"
-	ossyncKindCustomer    = "customer"
-	ossyncKindModelConfig = "model_config"
+	ossyncKindVirtualKey    = "virtual_key"
+	ossyncKindTeam          = "team"
+	ossyncKindCustomer      = "customer"
+	ossyncKindModelConfig   = "model_config"
+	ossyncKindBudgetReset   = "budget_reset"
+	ossyncKindCalendarAlign = "calendar_align"
 
 	ossyncOpReload = "reload"
 	ossyncOpRemove = "remove"
+	ossyncOpReset  = "reset"
 	ossyncOpPing   = "ping"
 )
 
@@ -74,9 +92,14 @@ type ossyncMessage struct {
 	Kind string   `json:"k,omitempty"`
 	Op   string   `json:"o"`
 	IDs  []string `json:"i,omitempty"`
+	// Budget resets and calendar alignment: IDs holds the budget IDs, these the
+	// owner the handler named and, for alignment, the rate limit IDs.
+	OwnerKind  string   `json:"ok,omitempty"`
+	OwnerID    string   `json:"oi,omitempty"`
+	RateLimits []string `json:"r,omitempty"`
 }
 
-// OSSync owns the listener and the safety loops for one node.
+// OSSync owns the listener, the sender and the repair loops for one node.
 type OSSync struct {
 	s      *BifrostHTTPServer
 	db     *gorm.DB
@@ -85,10 +108,23 @@ type OSSync struct {
 	catchupEvery   time.Duration
 	catchupWindow  time.Duration
 	reconcileEvery time.Duration
+	sweepEvery     time.Duration
+
+	queue chan ossyncMessage
 
 	listening atomic.Bool // LISTEN session is up
 	verified  atomic.Bool // our own ping came back through Postgres
 	pingToken string
+
+	// gapSince is the unix-nano time from which this node may have missed
+	// notifications: process start, or the last time the listener dropped.
+	// 0 means no open gap. Catch-up reaches back to it and clears it once a
+	// pass that started while listening succeeds.
+	gapSince atomic.Int64
+
+	// prevVKIDs is the virtual key ID set reconcile saw last time. Only the
+	// reconcile goroutine touches it.
+	prevVKIDs map[string]struct{}
 
 	stats ossyncStats
 
@@ -104,8 +140,14 @@ type ossyncStats struct {
 	CatchupReloads   atomic.Int64
 	ReconcileRemoves atomic.Int64
 	ReconcileReloads atomic.Int64
+	SweepRepairs     atomic.Int64
 	ListenerDrops    atomic.Int64
 	LastAppliedUnix  atomic.Int64
+}
+
+type ossyncStamp struct {
+	ID        string
+	UpdatedAt time.Time
 }
 
 // newOSSyncFromEnv returns nil unless BIFROST_OSS_SYNC is on and the config
@@ -128,15 +170,21 @@ func newOSSyncFromEnv(s *BifrostHTTPServer) *OSSync {
 		host, _ := os.Hostname()
 		nodeID = host + "-" + randomHex(4)
 	}
-	return &OSSync{
+	o := &OSSync{
 		s:              s,
 		db:             db,
 		nodeID:         nodeID,
 		catchupEvery:   envDuration("BIFROST_OSS_SYNC_CATCHUP_INTERVAL", 5*time.Second),
 		catchupWindow:  envDuration("BIFROST_OSS_SYNC_CATCHUP_WINDOW", 2*time.Minute),
 		reconcileEvery: envDuration("BIFROST_OSS_SYNC_RECONCILE_INTERVAL", 60*time.Second),
+		sweepEvery:     envDuration("BIFROST_OSS_SYNC_SWEEP_INTERVAL", 10*time.Minute),
+		queue:          make(chan ossyncMessage, ossyncQueueSize),
 		pingToken:      randomHex(8),
 	}
+	// Memory was loaded from the database before this point and nothing was
+	// listening since, so the gap opens now.
+	o.gapSince.Store(time.Now().UnixNano())
+	return o
 }
 
 // Wrap returns callbacks that broadcast governance changes after applying them
@@ -145,13 +193,16 @@ func (o *OSSync) Wrap() ServerCallbacks {
 	return &ossyncCallbacks{BifrostHTTPServer: o.s, sync: o}
 }
 
-// Start launches the listener and the safety loops. They stop with ctx.
+// Start launches the sender, the listener and the repair loops. They stop with
+// ctx. Call it only after the routes are registered.
 func (o *OSSync) Start(ctx context.Context) {
 	o.startOnce.Do(func() {
-		logger.Info("ossync: enabled, node=%s catchup=%s reconcile=%s", o.nodeID, o.catchupEvery, o.reconcileEvery)
+		logger.Info("ossync: enabled, node=%s catchup=%s reconcile=%s sweep=%s", o.nodeID, o.catchupEvery, o.reconcileEvery, o.sweepEvery)
+		go o.sendLoop(ctx)
 		go o.listenLoop(ctx)
 		go o.every(ctx, o.catchupEvery, o.catchup)
 		go o.every(ctx, o.reconcileEvery, o.reconcile)
+		go o.every(ctx, o.sweepEvery, o.sweep)
 		go o.registerMetricsLoop(ctx)
 	})
 }
@@ -161,12 +212,49 @@ func (o *OSSync) Start(ctx context.Context) {
 
 func (o *OSSync) publish(kind, op string, ids ...string) {
 	ids = compactIDs(ids)
-	if len(ids) == 0 {
-		return
-	}
 	for start := 0; start < len(ids); start += ossyncMaxIDsPerMessage {
 		end := min(start+ossyncMaxIDsPerMessage, len(ids))
-		o.send(ossyncMessage{Node: o.nodeID, Kind: kind, Op: op, IDs: ids[start:end]})
+		o.enqueue(ossyncMessage{Node: o.nodeID, Kind: kind, Op: op, IDs: ids[start:end]})
+	}
+}
+
+// publishBudgets queues a budget reset or calendar alignment. Rate limits ride
+// in the first message only, so a long budget list cannot apply them twice.
+func (o *OSSync) publishBudgets(kind string, owner handlers.BudgetUsageResetOwner, budgetIDs, rateLimitIDs []string) {
+	budgetIDs, rateLimitIDs = compactIDs(budgetIDs), compactIDs(rateLimitIDs)
+	if len(budgetIDs) == 0 && len(rateLimitIDs) == 0 {
+		return
+	}
+	for start := 0; start == 0 || start < len(budgetIDs); start += ossyncMaxIDsPerMessage {
+		end := min(start+ossyncMaxIDsPerMessage, len(budgetIDs))
+		msg := ossyncMessage{Node: o.nodeID, Kind: kind, Op: ossyncOpReset, IDs: budgetIDs[start:end], OwnerKind: owner.Kind, OwnerID: owner.ID}
+		if start == 0 {
+			msg.RateLimits = rateLimitIDs
+		}
+		o.enqueue(msg)
+	}
+}
+
+// enqueue never blocks: an admin request must not wait on peers.
+func (o *OSSync) enqueue(msg ossyncMessage) {
+	select {
+	case o.queue <- msg:
+	default:
+		o.stats.PublishErrors.Add(1)
+		logger.Warn("ossync: send queue full, dropping %s/%s (peers will catch up)", msg.Kind, msg.Op)
+	}
+}
+
+// sendLoop delivers queued messages one at a time, so peers see them in the
+// order this node made the changes.
+func (o *OSSync) sendLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-o.queue:
+			o.send(msg)
+		}
 	}
 }
 
@@ -177,8 +265,6 @@ func (o *OSSync) send(msg ossyncMessage) {
 		logger.Error("ossync: encode %s/%s: %v", msg.Kind, msg.Op, err)
 		return
 	}
-	// Detached from the request context: the local change already happened, and
-	// a client disconnect must not stop peers from hearing about it.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := o.db.WithContext(ctx).Exec("SELECT pg_notify(?, ?)", ossyncChannel, string(payload)).Error; err != nil {
@@ -210,6 +296,8 @@ func (o *OSSync) listenLoop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		// Anything published from now on may be missed until catch-up runs.
+		o.gapSince.CompareAndSwap(0, time.Now().UnixNano())
 		o.stats.ListenerDrops.Add(1)
 		if listened {
 			retry = time.Second
@@ -246,10 +334,9 @@ func (o *OSSync) listenOnce(ctx context.Context, sqlDB *sql.DB, listening func()
 	// Verify end to end: behind PgBouncer in transaction mode LISTEN succeeds
 	// but never receives anything. Our own ping proves the path works.
 	go o.send(ossyncMessage{Node: o.nodeID, Op: ossyncOpPing, IDs: []string{o.pingToken}})
-	// Anything published while we were not listening is picked up here
-	// instead of waiting for the next tick.
+	// Repair the gap now instead of waiting for the next tick.
 	go func() {
-		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
 		o.catchup(cctx)
 	}()
@@ -318,7 +405,7 @@ func (o *OSSync) handle(payload string) {
 	defer cancel()
 	if err := o.apply(ctx, msg); err != nil {
 		o.stats.ApplyErrors.Add(1)
-		logger.Warn("ossync: apply %s/%s from %s failed (catch-up will retry): %v", msg.Kind, msg.Op, msg.Node, err)
+		logger.Warn("ossync: apply %s/%s from %s failed (repair loops will retry): %v", msg.Kind, msg.Op, msg.Node, err)
 		return
 	}
 	o.stats.Applied.Add(1)
@@ -329,72 +416,191 @@ func (o *OSSync) handle(payload string) {
 // apply calls the server's own (non-broadcasting) methods.
 func (o *OSSync) apply(ctx context.Context, msg ossyncMessage) error {
 	s := o.s
-	var errs []error
 	switch msg.Kind {
 	case ossyncKindVirtualKey:
-		switch msg.Op {
-		case ossyncOpReload:
-			if len(msg.IDs) > 1 {
-				if err := s.ReloadVirtualKeys(ctx, msg.IDs); err == nil {
-					return nil
-				}
-			}
-			for _, id := range msg.IDs {
-				if _, err := s.ReloadVirtualKey(ctx, id); err != nil {
-					errs = append(errs, fmt.Errorf("vk %s: %w", id, err))
-				}
-			}
-		case ossyncOpRemove:
-			for _, id := range msg.IDs {
-				if err := s.RemoveVirtualKey(ctx, id); err != nil {
-					errs = append(errs, fmt.Errorf("vk %s: %w", id, err))
-				}
-			}
+		if msg.Op == ossyncOpRemove {
+			return o.forEach(msg.IDs, "vk", func(id string) error { return s.RemoveVirtualKey(ctx, id) })
 		}
-	case ossyncKindTeam:
-		for _, id := range msg.IDs {
-			var err error
-			if msg.Op == ossyncOpRemove {
-				err = s.RemoveTeam(ctx, id)
-			} else {
-				_, err = s.ReloadTeam(ctx, id)
-			}
-			if err != nil {
-				errs = append(errs, fmt.Errorf("team %s: %w", id, err))
-			}
+		if !o.reloadVirtualKeys(ctx, msg.IDs) {
+			return errors.New("one or more virtual keys failed to reload")
 		}
-	case ossyncKindCustomer:
-		for _, id := range msg.IDs {
-			var err error
-			if msg.Op == ossyncOpRemove {
-				err = s.RemoveCustomer(ctx, id)
-			} else {
-				_, err = s.ReloadCustomer(ctx, id)
-			}
-			if err != nil {
-				errs = append(errs, fmt.Errorf("customer %s: %w", id, err))
-			}
+		return nil
+	case ossyncKindTeam, ossyncKindCustomer, ossyncKindModelConfig:
+		e := o.entity(msg.Kind)
+		if msg.Op == ossyncOpRemove {
+			return o.forEach(msg.IDs, e.kind, func(id string) error { return e.remove(ctx, id) })
 		}
-	case ossyncKindModelConfig:
-		for _, id := range msg.IDs {
-			var err error
-			if msg.Op == ossyncOpRemove {
-				err = s.RemoveModelConfig(ctx, id)
-			} else {
-				_, err = s.ReloadModelConfig(ctx, id)
-			}
-			if err != nil {
-				errs = append(errs, fmt.Errorf("model config %s: %w", id, err))
-			}
-		}
+		return o.forEach(msg.IDs, e.kind, func(id string) error { return e.reload(ctx, id) })
+	case ossyncKindBudgetReset:
+		// The peer's own reload of the owner, sent just before this, carried its
+		// cached usage forward; this clears it, so its next dump cannot write the
+		// old usage back over the reset.
+		return s.ResetBudgetUsageInMemory(ctx, handlers.BudgetUsageResetOwner{Kind: msg.OwnerKind, ID: msg.OwnerID}, msg.IDs)
+	case ossyncKindCalendarAlign:
+		return s.AdoptCalendarAlignmentInMemory(ctx, handlers.BudgetUsageResetOwner{Kind: msg.OwnerKind, ID: msg.OwnerID}, msg.IDs, msg.RateLimits)
 	default:
 		return fmt.Errorf("unknown kind %q", msg.Kind)
+	}
+}
+
+func (o *OSSync) forEach(ids []string, label string, fn func(id string) error) error {
+	var errs []error
+	for _, id := range ids {
+		if err := fn(id); err != nil {
+			errs = append(errs, fmt.Errorf("%s %s: %w", label, id, err))
+		}
 	}
 	return errors.Join(errs...)
 }
 
+// reloadVirtualKeys reloads through the batched read, falling back per key.
+// It reports whether every key loaded.
+func (o *OSSync) reloadVirtualKeys(ctx context.Context, ids []string) bool {
+	if len(ids) == 0 {
+		return true
+	}
+	if len(ids) > 1 {
+		if err := o.s.ReloadVirtualKeys(ctx, ids); err == nil {
+			return true
+		}
+	}
+	ok := true
+	for _, id := range ids {
+		if _, err := o.s.ReloadVirtualKey(ctx, id); err != nil {
+			ok = false
+			logger.Warn("ossync: reload virtual key %s: %v", id, err)
+		}
+	}
+	return ok
+}
+
 // ---------------------------------------------------------------------------
-// Safety loops
+// Entities other than virtual keys
+
+type ossyncEntity struct {
+	kind     string
+	model    any
+	inMemory func(d *governance.GovernanceData) map[string]time.Time
+	reload   func(ctx context.Context, id string) error
+	remove   func(ctx context.Context, id string) error
+}
+
+func (o *OSSync) entities() []ossyncEntity {
+	s := o.s
+	return []ossyncEntity{
+		{
+			kind:  ossyncKindTeam,
+			model: &tables.TableTeam{},
+			inMemory: func(d *governance.GovernanceData) map[string]time.Time {
+				m := make(map[string]time.Time, len(d.Teams))
+				for _, t := range d.Teams {
+					if t != nil {
+						m[t.ID] = t.UpdatedAt
+					}
+				}
+				return m
+			},
+			reload: func(ctx context.Context, id string) error { _, err := s.ReloadTeam(ctx, id); return err },
+			remove: s.RemoveTeam,
+		},
+		{
+			kind:  ossyncKindCustomer,
+			model: &tables.TableCustomer{},
+			inMemory: func(d *governance.GovernanceData) map[string]time.Time {
+				m := make(map[string]time.Time, len(d.Customers))
+				for _, c := range d.Customers {
+					if c != nil {
+						m[c.ID] = c.UpdatedAt
+					}
+				}
+				return m
+			},
+			reload: func(ctx context.Context, id string) error { _, err := s.ReloadCustomer(ctx, id); return err },
+			remove: s.RemoveCustomer,
+		},
+		{
+			kind:  ossyncKindModelConfig,
+			model: &tables.TableModelConfig{},
+			inMemory: func(d *governance.GovernanceData) map[string]time.Time {
+				m := make(map[string]time.Time, len(d.ModelConfigs))
+				for _, mc := range d.ModelConfigs {
+					if mc != nil {
+						m[mc.ID] = mc.UpdatedAt
+					}
+				}
+				return m
+			},
+			reload: func(ctx context.Context, id string) error { _, err := s.ReloadModelConfig(ctx, id); return err },
+			remove: s.RemoveModelConfig,
+		},
+	}
+}
+
+func (o *OSSync) entity(kind string) ossyncEntity {
+	for _, e := range o.entities() {
+		if e.kind == kind {
+			return e
+		}
+	}
+	panic("ossync: no entity " + kind)
+}
+
+// repairEntities reloads teams, customers and model configs whose row is newer
+// than memory. With since nil it compares every row and also removes entities
+// that are in memory but no longer in the database. data, when nil, is read
+// lazily, so a pass that finds no changed rows does not snapshot memory.
+func (o *OSSync) repairEntities(ctx context.Context, store governance.GovernanceStore, data *governance.GovernanceData, since *time.Time) (int, error) {
+	repaired := 0
+	var errs []error
+	for _, e := range o.entities() {
+		var rows []ossyncStamp
+		if err := o.pageStamps(ctx, e.model, since, func(page []ossyncStamp) error {
+			rows = append(rows, page...)
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", e.kind, err))
+			continue
+		}
+		if since != nil && len(rows) == 0 {
+			continue
+		}
+		if data == nil {
+			if data = store.GetGovernanceData(ctx); data == nil {
+				return repaired, errors.New("governance data unavailable")
+			}
+		}
+		mem := e.inMemory(data)
+		inDB := make(map[string]struct{}, len(rows))
+		for _, r := range rows {
+			inDB[r.ID] = struct{}{}
+			if at, ok := mem[r.ID]; ok && !at.Before(r.UpdatedAt) {
+				continue
+			}
+			if err := e.reload(ctx, r.ID); err != nil {
+				errs = append(errs, fmt.Errorf("%s %s: %w", e.kind, r.ID, err))
+				continue
+			}
+			repaired++
+		}
+		if since != nil {
+			continue
+		}
+		for id := range mem {
+			if _, ok := inDB[id]; ok {
+				continue
+			}
+			if err := e.remove(ctx, id); err != nil {
+				errs = append(errs, fmt.Errorf("%s %s: %w", e.kind, id, err))
+				continue
+			}
+			repaired++
+		}
+	}
+	return repaired, errors.Join(errs...)
+}
+
+// ---------------------------------------------------------------------------
+// Repair loops
 
 func (o *OSSync) every(ctx context.Context, interval time.Duration, fn func(context.Context)) {
 	if interval <= 0 {
@@ -407,86 +613,137 @@ func (o *OSSync) every(ctx context.Context, interval time.Duration, fn func(cont
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			runCtx, cancel := context.WithTimeout(ctx, interval)
+			runCtx, cancel := context.WithTimeout(ctx, max(interval, time.Minute))
 			fn(runCtx)
 			cancel()
 		}
 	}
 }
 
-type ossyncVKStamp struct {
-	ID        string
-	UpdatedAt time.Time
+// pageStamps reads (id, updated_at) for a table in pages of ossyncPageSize and
+// hands each page to fn. With since set it reads only rows updated after it,
+// in (updated_at, id) order; otherwise every row, in id order. Paging means a
+// burst of changes larger than one page is still read to the end.
+func (o *OSSync) pageStamps(ctx context.Context, model any, since *time.Time, fn func([]ossyncStamp) error) error {
+	var lastAt time.Time
+	lastID := ""
+	for first := true; ; first = false {
+		q := o.db.WithContext(ctx).Model(model).Select("id, updated_at")
+		if since != nil {
+			if first {
+				q = q.Where("updated_at > ?", *since)
+			} else {
+				q = q.Where("updated_at > ? OR (updated_at = ? AND id > ?)", lastAt, lastAt, lastID)
+			}
+			q = q.Order("updated_at, id")
+		} else {
+			if !first {
+				q = q.Where("id > ?", lastID)
+			}
+			q = q.Order("id")
+		}
+		var rows []ossyncStamp
+		if err := q.Limit(ossyncPageSize).Scan(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) > 0 {
+			if err := fn(rows); err != nil {
+				return err
+			}
+			last := rows[len(rows)-1]
+			lastAt, lastID = last.UpdatedAt, last.ID
+		}
+		if len(rows) < ossyncPageSize {
+			return nil
+		}
+	}
 }
 
-// catchup reloads virtual keys whose row is newer than the in-memory copy.
-// A sliding window (rather than a watermark) tolerates clock skew between the
-// nodes that stamp updated_at.
+// staleVirtualKeys returns the IDs of rows that memory lacks or holds an older
+// copy of. It also reports every ID it saw, for reconcile.
+func (o *OSSync) staleVirtualKeys(ctx context.Context, store governance.GovernanceStore, since *time.Time, seen map[string]struct{}) ([]string, error) {
+	var stale []string
+	err := o.pageStamps(ctx, &tables.TableVirtualKey{}, since, func(rows []ossyncStamp) error {
+		for _, r := range rows {
+			if seen != nil {
+				seen[r.ID] = struct{}{}
+			}
+			vk, found := store.GetVirtualKeyByID(ctx, r.ID)
+			if !found || vk.UpdatedAt.Before(r.UpdatedAt) {
+				stale = append(stale, r.ID)
+			}
+		}
+		return nil
+	})
+	return stale, err
+}
+
+// catchup reloads entities whose row is newer than memory. It looks back
+// catchupWindow, or to the open gap if that is older, so a listener that was
+// down for an hour still gets the hour's changes. The window tolerates clock
+// skew between the nodes that stamp updated_at.
 func (o *OSSync) catchup(ctx context.Context) {
 	store, ok := o.governanceStore()
 	if !ok {
 		return
 	}
-	var rows []ossyncVKStamp
-	err := o.db.WithContext(ctx).
-		Model(&tables.TableVirtualKey{}).
-		Select("id, updated_at").
-		Where("updated_at > ?", time.Now().Add(-o.catchupWindow)).
-		Order("updated_at").
-		Limit(5000).
-		Scan(&rows).Error
-	if err != nil {
-		logger.Warn("ossync: catch-up query failed: %v", err)
-		return
-	}
-	var stale []string
-	for _, r := range rows {
-		vk, found := store.GetVirtualKeyByID(ctx, r.ID)
-		if !found || vk.UpdatedAt.Before(r.UpdatedAt) {
-			stale = append(stale, r.ID)
+	gap := o.gapSince.Load()
+	listeningAtStart := o.listening.Load()
+	since := time.Now().Add(-o.catchupWindow)
+	if gap != 0 {
+		if g := time.Unix(0, gap).Add(-o.catchupWindow); g.Before(since) {
+			since = g
 		}
 	}
-	if len(stale) == 0 {
-		return
+
+	clean := true
+	stale, err := o.staleVirtualKeys(ctx, store, &since, nil)
+	if err != nil {
+		clean = false
+		logger.Warn("ossync: catch-up query failed: %v", err)
+	} else if len(stale) > 0 {
+		o.stats.CatchupReloads.Add(int64(len(stale)))
+		logger.Info("ossync: catch-up reloading %d virtual key(s) that missed a notification", len(stale))
+		clean = o.reloadVirtualKeys(ctx, stale)
 	}
-	o.stats.CatchupReloads.Add(int64(len(stale)))
-	logger.Info("ossync: catch-up reloading %d virtual key(s) that missed a notification", len(stale))
-	o.reloadLocal(ctx, stale)
+	n, err := o.repairEntities(ctx, store, nil, &since)
+	if n > 0 {
+		o.stats.CatchupReloads.Add(int64(n))
+		logger.Info("ossync: catch-up repaired %d team(s), customer(s) or model config(s)", n)
+	}
+	if err != nil {
+		clean = false
+		logger.Warn("ossync: catch-up: %v", err)
+	}
+
+	// Close the gap only when this pass covered all of it: it began while the
+	// listener was up and everything it found loaded.
+	if clean && listeningAtStart && gap != 0 && o.gapSince.CompareAndSwap(gap, 0) {
+		logger.Info("ossync: caught up since %s", time.Unix(0, gap).UTC().Format(time.RFC3339))
+	}
 }
 
-// reconcile drops in-memory virtual keys whose row is gone and loads rows the
-// node has never seen. Memory is snapshotted before the query, so a key
-// created in between is never mistaken for a deleted one.
+// reconcile compares every virtual key row with memory, reloads the stale or
+// missing ones, and removes keys whose row disappeared since its previous pass.
+// It reads only (id, updated_at), a page at a time.
 func (o *OSSync) reconcile(ctx context.Context) {
 	store, ok := o.governanceStore()
 	if !ok {
 		return
 	}
-	data := store.GetGovernanceData(ctx)
-	if data == nil {
-		return
-	}
-	inMemory := make(map[string]struct{}, len(data.VirtualKeys))
-	for _, vk := range data.VirtualKeys {
-		if vk != nil {
-			inMemory[vk.ID] = struct{}{}
-		}
-	}
-	var ids []string
-	if err := o.db.WithContext(ctx).Model(&tables.TableVirtualKey{}).Pluck("id", &ids).Error; err != nil {
+	seen := make(map[string]struct{}, len(o.prevVKIDs))
+	stale, err := o.staleVirtualKeys(ctx, store, nil, seen)
+	if err != nil {
 		logger.Warn("ossync: reconcile query failed: %v", err)
 		return
 	}
-	inDB := make(map[string]struct{}, len(ids))
-	var missing []string
-	for _, id := range ids {
-		inDB[id] = struct{}{}
-		if _, ok := inMemory[id]; !ok {
-			missing = append(missing, id)
-		}
+	if len(stale) > 0 {
+		o.stats.ReconcileReloads.Add(int64(len(stale)))
+		logger.Info("ossync: reconcile reloading %d stale or missing virtual key(s)", len(stale))
+		o.reloadVirtualKeys(ctx, stale)
 	}
-	for id := range inMemory {
-		if _, ok := inDB[id]; ok {
+	for id := range o.prevVKIDs {
+		if _, ok := seen[id]; ok {
 			continue
 		}
 		if err := o.s.RemoveVirtualKey(ctx, id); err != nil {
@@ -496,21 +753,56 @@ func (o *OSSync) reconcile(ctx context.Context) {
 		o.stats.ReconcileRemoves.Add(1)
 		logger.Info("ossync: reconcile removed virtual key %s (deleted on another node)", id)
 	}
-	if len(missing) > 0 {
-		o.stats.ReconcileReloads.Add(int64(len(missing)))
-		logger.Info("ossync: reconcile loading %d virtual key(s) missing from memory", len(missing))
-		o.reloadLocal(ctx, missing)
-	}
+	o.prevVKIDs = seen
 }
 
-func (o *OSSync) reloadLocal(ctx context.Context, ids []string) {
-	if err := o.s.ReloadVirtualKeys(ctx, ids); err == nil {
+// sweep compares all of memory with the database: virtual keys memory holds
+// whose row is gone (including any created and deleted between two reconcile
+// passes), and every team, customer and model config. It is the only pass that
+// snapshots the whole governance state, so it runs rarely.
+func (o *OSSync) sweep(ctx context.Context) {
+	store, ok := o.governanceStore()
+	if !ok {
 		return
 	}
-	for _, id := range ids {
-		if _, err := o.s.ReloadVirtualKey(ctx, id); err != nil {
-			logger.Warn("ossync: reload %s: %v", id, err)
+	// Snapshot memory before reading the database, so an entity created in
+	// between is never mistaken for a deleted one.
+	data := store.GetGovernanceData(ctx)
+	if data == nil {
+		return
+	}
+	inDB := make(map[string]struct{}, len(data.VirtualKeys))
+	if err := o.pageStamps(ctx, &tables.TableVirtualKey{}, nil, func(rows []ossyncStamp) error {
+		for _, r := range rows {
+			inDB[r.ID] = struct{}{}
 		}
+		return nil
+	}); err != nil {
+		logger.Warn("ossync: sweep query failed: %v", err)
+		return
+	}
+	repaired := 0
+	for _, vk := range data.VirtualKeys {
+		if vk == nil {
+			continue
+		}
+		if _, ok := inDB[vk.ID]; ok {
+			continue
+		}
+		if err := o.s.RemoveVirtualKey(ctx, vk.ID); err != nil {
+			logger.Warn("ossync: sweep remove %s: %v", vk.ID, err)
+			continue
+		}
+		repaired++
+	}
+	n, err := o.repairEntities(ctx, store, data, nil)
+	repaired += n
+	if err != nil {
+		logger.Warn("ossync: sweep: %v", err)
+	}
+	if repaired > 0 {
+		o.stats.SweepRepairs.Add(int64(repaired))
+		logger.Info("ossync: sweep repaired %d entit(ies) the other loops missed", repaired)
 	}
 }
 
@@ -531,8 +823,10 @@ func (o *OSSync) governanceStore() (governance.GovernanceStore, bool) {
 // collector reads the live counters at scrape time; nothing is duplicated.
 //
 // Suggested alerts:
-//   bifrost_ossync_listener_connected == 0 for 30s   -> node is not hearing peers
+//   bifrost_ossync_listener_connected == 0 for 30s     -> node is not hearing peers
+//   bifrost_ossync_catchup_gap_open == 1 for 5m         -> node cannot repair a gap
 //   rate(bifrost_ossync_catchup_reloads_total[15m]) > 0 -> notifications are being lost
+//   rate(bifrost_ossync_sweep_repairs_total[1h]) > 0    -> catch-up and reconcile are missing changes
 
 type ossyncMetric struct {
 	desc  *prometheus.Desc
@@ -566,22 +860,33 @@ func newOSSyncCollector(o *OSSync) *ossyncCollector {
 			func(o *OSSync) float64 { return boolMetric(&o.verified) }),
 		m("listener_drops_total", "LISTEN connections lost and retried.", counter,
 			func(o *OSSync) float64 { return float64(o.stats.ListenerDrops.Load()) }),
+		m("catchup_gap_open", "1 while this node may have missed notifications that catch-up has not repaired yet.", gauge,
+			func(o *OSSync) float64 {
+				if o.gapSince.Load() != 0 {
+					return 1
+				}
+				return 0
+			}),
+		m("send_queue_length", "Change notifications waiting to be sent.", gauge,
+			func(o *OSSync) float64 { return float64(len(o.queue)) }),
 		m("messages_published_total", "Change notifications this node sent.", counter,
 			func(o *OSSync) float64 { return float64(o.stats.Published.Load()) }),
-		m("publish_errors_total", "Change notifications that failed to send (peers converge via catch-up).", counter,
+		m("publish_errors_total", "Change notifications not sent: a failed send or a full queue (peers converge via catch-up).", counter,
 			func(o *OSSync) float64 { return float64(o.stats.PublishErrors.Load()) }),
 		m("messages_received_total", "Change notifications received from other nodes.", counter,
 			func(o *OSSync) float64 { return float64(o.stats.Received.Load()) }),
 		m("messages_applied_total", "Received notifications applied to memory.", counter,
 			func(o *OSSync) float64 { return float64(o.stats.Applied.Load()) }),
-		m("apply_errors_total", "Received notifications that failed to apply (retried by catch-up).", counter,
+		m("apply_errors_total", "Received notifications that failed to apply (retried by the repair loops).", counter,
 			func(o *OSSync) float64 { return float64(o.stats.ApplyErrors.Load()) }),
-		m("catchup_reloads_total", "Virtual keys reloaded by catch-up because a notification was missed.", counter,
+		m("catchup_reloads_total", "Entities reloaded by catch-up because a notification was missed.", counter,
 			func(o *OSSync) float64 { return float64(o.stats.CatchupReloads.Load()) }),
 		m("reconcile_removes_total", "Virtual keys removed by reconcile because their delete was missed.", counter,
 			func(o *OSSync) float64 { return float64(o.stats.ReconcileRemoves.Load()) }),
-		m("reconcile_reloads_total", "Virtual keys loaded by reconcile because this node had never seen them.", counter,
+		m("reconcile_reloads_total", "Virtual keys reloaded by reconcile because memory was stale or missing them.", counter,
 			func(o *OSSync) float64 { return float64(o.stats.ReconcileReloads.Load()) }),
+		m("sweep_repairs_total", "Entities fixed by the sweep that catch-up and reconcile had missed.", counter,
+			func(o *OSSync) float64 { return float64(o.stats.SweepRepairs.Load()) }),
 		m("last_applied_timestamp_seconds", "Unix time of the last notification applied from another node (0 if none).", gauge,
 			func(o *OSSync) float64 { return float64(o.stats.LastAppliedUnix.Load()) }),
 	}}
@@ -716,6 +1021,24 @@ func (c *ossyncCallbacks) RemoveModelConfig(ctx context.Context, id string) erro
 	err := c.BifrostHTTPServer.RemoveModelConfig(ctx, id)
 	if err == nil {
 		c.sync.publish(ossyncKindModelConfig, ossyncOpRemove, id)
+	}
+	return err
+}
+
+// ResetBudgetUsageInMemory must reach peers: each keeps the old usage in
+// memory, and its next dump would write it back over the reset in Postgres.
+func (c *ossyncCallbacks) ResetBudgetUsageInMemory(ctx context.Context, owner handlers.BudgetUsageResetOwner, budgetIDs []string) error {
+	err := c.BifrostHTTPServer.ResetBudgetUsageInMemory(ctx, owner, budgetIDs)
+	if err == nil {
+		c.sync.publishBudgets(ossyncKindBudgetReset, owner, budgetIDs, nil)
+	}
+	return err
+}
+
+func (c *ossyncCallbacks) AdoptCalendarAlignmentInMemory(ctx context.Context, owner handlers.BudgetUsageResetOwner, budgetIDs []string, rateLimitIDs []string) error {
+	err := c.BifrostHTTPServer.AdoptCalendarAlignmentInMemory(ctx, owner, budgetIDs, rateLimitIDs)
+	if err == nil {
+		c.sync.publishBudgets(ossyncKindCalendarAlign, owner, budgetIDs, rateLimitIDs)
 	}
 	return err
 }

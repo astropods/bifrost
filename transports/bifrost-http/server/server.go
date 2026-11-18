@@ -3796,9 +3796,9 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 	// Register routes. With BIFROST_OSS_SYNC=1 the governance callbacks are
 	// wrapped so changes made on this node reach every other node (ossync.go).
 	var callbacks ServerCallbacks = s
-	if ossync := newOSSyncFromEnv(s); ossync != nil {
+	ossync := newOSSyncFromEnv(s)
+	if ossync != nil {
 		callbacks = ossync.Wrap()
-		ossync.Start(s.Ctx)
 	}
 	err = s.RegisterAPIRoutes(s.Ctx, callbacks, apiMiddlewares...)
 	if err != nil {
@@ -3816,6 +3816,11 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 			s.OAuth2SweepWorker = nil
 		}
 		return fmt.Errorf("failed to initialize routes: %v", err)
+	}
+	// Only once the routes exist: a failed bootstrap must not leave the listener
+	// running against a half-built server.
+	if ossync != nil {
+		ossync.Start(s.Ctx)
 	}
 	// Registering inference routes
 	// The pre-auth plugin phase runs immediately before the auth middlewares so a plugin can
