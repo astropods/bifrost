@@ -50,25 +50,26 @@ const (
 	ctrBatch = 500
 )
 
-// ossyncUsageRow is one replica's usage of one limit in one window.
+// ossyncUsageRow is one replica's usage of one limit in one window. Rows are
+// read with gorm by column name; the table itself is defined in ctrSchema.
 type ossyncUsageRow struct {
-	Kind        string    `gorm:"primaryKey;size:16"`
-	LimitID     string    `gorm:"primaryKey;size:255"`
-	WindowStart int64     `gorm:"primaryKey"` // the limit's last_reset, unix microseconds
-	Epoch       int64     `gorm:"primaryKey"` // moves on an operator usage reset
-	NodeID      string    `gorm:"primaryKey;size:255"`
-	Usage       float64   `gorm:"not null"`
-	UpdatedAt   time.Time `gorm:"index;not null"`
+	Kind        string
+	LimitID     string
+	WindowStart int64 // the limit's last_reset, unix microseconds
+	Epoch       int64 // moves on an operator usage reset
+	NodeID      string
+	Usage       float64
+	UpdatedAt   time.Time
 }
 
 func (ossyncUsageRow) TableName() string { return "astropods_ossync_usage" }
 
 // ossyncEpochRow holds the current epoch of a budget whose usage an operator reset.
 type ossyncEpochRow struct {
-	Kind      string    `gorm:"primaryKey;size:16"`
-	LimitID   string    `gorm:"primaryKey;size:255"`
-	Epoch     int64     `gorm:"not null"`
-	UpdatedAt time.Time `gorm:"index;not null"`
+	Kind      string
+	LimitID   string
+	Epoch     int64
+	UpdatedAt time.Time
 }
 
 func (ossyncEpochRow) TableName() string { return "astropods_ossync_epoch" }
@@ -202,9 +203,62 @@ func (c *counterSync) onAdopt(budgetIDs, rateLimitIDs []string) {
 // ---------------------------------------------------------------------------
 // Loop
 
+// ctrSchema creates counter sync's tables. It is the whole schema: these
+// tables live outside upstream's versioned migrations, so a change here must
+// stay additive (new columns with defaults, new indexes) and keep IF NOT EXISTS.
+var ctrSchema = []string{
+	`CREATE TABLE IF NOT EXISTS astropods_ossync_usage (
+		kind         text             NOT NULL,
+		limit_id     text             NOT NULL,
+		window_start bigint           NOT NULL,
+		epoch        bigint           NOT NULL,
+		node_id      text             NOT NULL,
+		usage        double precision NOT NULL,
+		updated_at   timestamptz      NOT NULL DEFAULT now(),
+		PRIMARY KEY (kind, limit_id, window_start, epoch, node_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_astropods_ossync_usage_updated_at ON astropods_ossync_usage (updated_at)`,
+	`CREATE TABLE IF NOT EXISTS astropods_ossync_epoch (
+		kind       text        NOT NULL,
+		limit_id   text        NOT NULL,
+		epoch      bigint      NOT NULL,
+		updated_at timestamptz NOT NULL DEFAULT now(),
+		PRIMARY KEY (kind, limit_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_astropods_ossync_epoch_updated_at ON astropods_ossync_epoch (updated_at)`,
+}
+
+// createTables runs ctrSchema until it succeeds or ctx ends. Replicas starting
+// together on a fresh database race here: Postgres can fail one session's
+// CREATE ... IF NOT EXISTS with a duplicate-key error on its catalogs while
+// another session creates the same table. The retry then finds the table.
+func (c *counterSync) createTables(ctx context.Context) bool {
+	retry := 500 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			for _, stmt := range ctrSchema {
+				if err := tx.Exec(stmt).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err == nil {
+			return true
+		}
+		c.stats.WriteErrors.Add(1)
+		logger.Warn("ossync: counters: create tables (attempt %d), retrying in %s: %v", attempt, retry, err)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(retry):
+		}
+		retry = min(retry*2, 30*time.Second)
+	}
+}
+
 func (c *counterSync) run(ctx context.Context) {
-	if err := c.db.WithContext(ctx).AutoMigrate(&ossyncUsageRow{}, &ossyncEpochRow{}); err != nil {
-		logger.Error("ossync: counters: create tables: %v; counter sync disabled", err)
+	if !c.createTables(ctx) {
 		return
 	}
 	// The epochs as they stand: memory was loaded after any reset they record,
