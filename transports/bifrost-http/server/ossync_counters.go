@@ -35,6 +35,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/plugins/governance"
 	"gorm.io/gorm"
 )
@@ -319,9 +320,20 @@ func (c *counterSync) tick(ctx context.Context) {
 				st.folded = e.usage
 				st.written, st.wrote = 0, false
 			}
+		case st.epoch == epoch && st.window != e.window && len(c.rows[key]) > 0 &&
+			st.folded+st.written > 0 && e.usage >= st.folded+st.written:
+			// The window moved but the usage did not drop: it was carried over
+			// (calendar adoption, with or without its message, or a reload that
+			// changed last_reset), not reset. Memory still holds the other
+			// replicas' share, so join the window they already count in instead
+			// of claiming it all as this node's own. A real reset zeroes memory
+			// and takes the branch below.
+			prev := c.rows[key][me]
+			st.window = e.window
+			st.folded, st.written, st.wrote = e.usage-prev, prev, hasNode(c.rows[key], me)
 		case st.window != e.window || st.epoch != epoch:
-			// The window closed (memory was reset) or an operator reset moved
-			// the epoch: everything in memory now is this node's own.
+			// First into a new window, or an operator reset moved the epoch:
+			// everything in memory now is this node's own.
 			st.window, st.epoch = e.window, epoch
 			st.folded, st.written, st.wrote = 0, 0, false
 		}
@@ -430,18 +442,29 @@ func (c *counterSync) upsert(ctx context.Context, rows []ossyncUsageRow, seedOnl
 		chunk := rows[start:min(start+ctrBatch, len(rows))]
 		var sb strings.Builder
 		args := make([]any, 0, len(chunk)*6)
-		sb.WriteString("INSERT INTO astropods_ossync_usage (kind, limit_id, window_start, epoch, node_id, usage, updated_at) VALUES ")
-		for i, r := range chunk {
-			if i > 0 {
-				sb.WriteString(", ")
-			}
-			sb.WriteString("(?, ?, ?, ?, ?, ?, now())")
-			args = append(args, r.Kind, r.LimitID, r.WindowStart, r.Epoch, r.NodeID, r.Usage)
-		}
 		if seedOnly {
-			// Two replicas starting together must not both seed a window.
+			// A seed goes in only while the window has no rows at all: a replica
+			// that already counts there carries the usage. The primary key keeps
+			// two replicas seeding at once down to one seed.
+			sb.WriteString("INSERT INTO astropods_ossync_usage (kind, limit_id, window_start, epoch, node_id, usage, updated_at) SELECT v.kind, v.limit_id, v.ws, v.ep, v.node, v.usage, now() FROM (VALUES ")
+			for i, r := range chunk {
+				if i > 0 {
+					sb.WriteString(", ")
+				}
+				sb.WriteString("(?::text, ?::text, ?::bigint, ?::bigint, ?::text, ?::double precision)")
+				args = append(args, r.Kind, r.LimitID, r.WindowStart, r.Epoch, r.NodeID, r.Usage)
+			}
+			sb.WriteString(") AS v(kind, limit_id, ws, ep, node, usage) WHERE NOT EXISTS (SELECT 1 FROM astropods_ossync_usage u WHERE u.kind = v.kind AND u.limit_id = v.limit_id AND u.window_start = v.ws AND u.epoch = v.ep)")
 			sb.WriteString(" ON CONFLICT (kind, limit_id, window_start, epoch, node_id) DO NOTHING")
 		} else {
+			sb.WriteString("INSERT INTO astropods_ossync_usage (kind, limit_id, window_start, epoch, node_id, usage, updated_at) VALUES ")
+			for i, r := range chunk {
+				if i > 0 {
+					sb.WriteString(", ")
+				}
+				sb.WriteString("(?, ?, ?, ?, ?, ?, now())")
+				args = append(args, r.Kind, r.LimitID, r.WindowStart, r.Epoch, r.NodeID, r.Usage)
+			}
 			sb.WriteString(" ON CONFLICT (kind, limit_id, window_start, epoch, node_id) DO UPDATE SET usage = EXCLUDED.usage, updated_at = now()")
 		}
 		if err := c.db.WithContext(ctx).Exec(sb.String(), args...).Error; err != nil {
@@ -537,8 +560,29 @@ func (c *counterSync) gc(ctx context.Context) {
 		}
 		removed += res.RowsAffected
 	}
+
+	// Rows and epochs of limits that were deleted. This asks the governance
+	// tables, not this node's memory, so a limit another node knows of and
+	// this one has not loaded yet is never taken for deleted.
+	budgets, rateLimits := tables.TableBudget{}.TableName(), tables.TableRateLimit{}.TableName()
+	for _, stmt := range []struct {
+		sql  string
+		args []any
+	}{
+		{"DELETE FROM astropods_ossync_usage u WHERE u.kind = ? AND NOT EXISTS (SELECT 1 FROM " + budgets + " b WHERE b.id = u.limit_id)", []any{ctrKindBudget}},
+		{"DELETE FROM astropods_ossync_usage u WHERE u.kind IN (?, ?) AND NOT EXISTS (SELECT 1 FROM " + rateLimits + " r WHERE r.id = u.limit_id)", []any{ctrKindTokens, ctrKindRequests}},
+		{"DELETE FROM astropods_ossync_epoch e WHERE e.kind = ? AND NOT EXISTS (SELECT 1 FROM " + budgets + " b WHERE b.id = e.limit_id)", []any{ctrKindBudget}},
+	} {
+		res := c.db.WithContext(ctx).Exec(stmt.sql, stmt.args...)
+		if res.Error != nil {
+			logger.Warn("ossync: counters: gc deleted limits: %v", res.Error)
+			continue
+		}
+		removed += res.RowsAffected
+	}
+
 	if removed > 0 {
-		logger.Debug("ossync: counters: gc removed %d old row(s)", removed)
+		logger.Debug("ossync: counters: gc removed %d row(s)", removed)
 		c.lastFull = time.Time{} // drop them from the cache on the next tick
 	}
 }
