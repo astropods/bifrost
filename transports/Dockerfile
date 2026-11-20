@@ -12,6 +12,9 @@
   # Copy UI source code
   COPY ui/ ./
 
+  # astropods: typecheck needs more than Node's default ~2 GB heap
+  ENV NODE_OPTIONS=--max-old-space-size=4096
+
   # Build UI (skip the copy-build step)
   RUN npm run build-enterprise
   # Skip the copy-build step since we'll copy the files in the Go build stage
