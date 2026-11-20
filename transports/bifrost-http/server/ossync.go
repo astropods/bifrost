@@ -29,8 +29,9 @@ package server
 //   - Health is exported as bifrost_ossync_* Prometheus metrics on /metrics.
 //
 // Not synced: provider configuration and keys (the providers handler edits the
-// in-memory config and client directly), virtual MCPs, and live budget and
-// rate-limit usage counters, which stay per node.
+// in-memory config and client directly) and virtual MCPs. Live budget and
+// rate-limit usage is shared only with BIFROST_OSS_SYNC_COUNTERS=1
+// (ossync_counters.go); otherwise each node counts its own.
 //
 // Nothing here is on the request path: if the listener or the loops fail, the
 // node keeps serving from memory exactly as upstream OSS does.
@@ -97,6 +98,8 @@ type ossyncMessage struct {
 	OwnerKind  string   `json:"ok,omitempty"`
 	OwnerID    string   `json:"oi,omitempty"`
 	RateLimits []string `json:"r,omitempty"`
+	// Budget resets: the reset's epoch for counter sync (ossync_counters.go).
+	Epoch int64 `json:"e,omitempty"`
 }
 
 // OSSync owns the listener, the sender and the repair loops for one node.
@@ -127,6 +130,10 @@ type OSSync struct {
 	prevVKIDs map[string]struct{}
 
 	stats ossyncStats
+
+	// counters shares budget and rate-limit usage; nil unless
+	// BIFROST_OSS_SYNC_COUNTERS is on.
+	counters *counterSync
 
 	startOnce sync.Once
 }
@@ -184,6 +191,7 @@ func newOSSyncFromEnv(s *BifrostHTTPServer) *OSSync {
 	// Memory was loaded from the database before this point and nothing was
 	// listening since, so the gap opens now.
 	o.gapSince.Store(time.Now().UnixNano())
+	o.counters = newCounterSyncFromEnv(o)
 	return o
 }
 
@@ -204,6 +212,9 @@ func (o *OSSync) Start(ctx context.Context) {
 		go o.every(ctx, o.reconcileEvery, o.reconcile)
 		go o.every(ctx, o.sweepEvery, o.sweep)
 		go o.registerMetricsLoop(ctx)
+		if o.counters != nil {
+			go o.counters.run(ctx)
+		}
 	})
 }
 
@@ -220,14 +231,14 @@ func (o *OSSync) publish(kind, op string, ids ...string) {
 
 // publishBudgets queues a budget reset or calendar alignment. Rate limits ride
 // in the first message only, so a long budget list cannot apply them twice.
-func (o *OSSync) publishBudgets(kind string, owner handlers.BudgetUsageResetOwner, budgetIDs, rateLimitIDs []string) {
+func (o *OSSync) publishBudgets(kind string, owner handlers.BudgetUsageResetOwner, budgetIDs, rateLimitIDs []string, epoch int64) {
 	budgetIDs, rateLimitIDs = compactIDs(budgetIDs), compactIDs(rateLimitIDs)
 	if len(budgetIDs) == 0 && len(rateLimitIDs) == 0 {
 		return
 	}
 	for start := 0; start == 0 || start < len(budgetIDs); start += ossyncMaxIDsPerMessage {
 		end := min(start+ossyncMaxIDsPerMessage, len(budgetIDs))
-		msg := ossyncMessage{Node: o.nodeID, Kind: kind, Op: ossyncOpReset, IDs: budgetIDs[start:end], OwnerKind: owner.Kind, OwnerID: owner.ID}
+		msg := ossyncMessage{Node: o.nodeID, Kind: kind, Op: ossyncOpReset, IDs: budgetIDs[start:end], OwnerKind: owner.Kind, OwnerID: owner.ID, Epoch: epoch}
 		if start == 0 {
 			msg.RateLimits = rateLimitIDs
 		}
@@ -435,9 +446,19 @@ func (o *OSSync) apply(ctx context.Context, msg ossyncMessage) error {
 		// The peer's own reload of the owner, sent just before this, carried its
 		// cached usage forward; this clears it, so its next dump cannot write the
 		// old usage back over the reset.
-		return s.ResetBudgetUsageInMemory(ctx, handlers.BudgetUsageResetOwner{Kind: msg.OwnerKind, ID: msg.OwnerID}, msg.IDs)
+		if err := s.ResetBudgetUsageInMemory(ctx, handlers.BudgetUsageResetOwner{Kind: msg.OwnerKind, ID: msg.OwnerID}, msg.IDs); err != nil {
+			return err
+		}
+		// Memory is reset; move to the new epoch so other replicas' pre-reset
+		// usage stops counting here.
+		o.counters.onReset(ctx, msg.IDs, msg.Epoch, true, false)
+		return nil
 	case ossyncKindCalendarAlign:
-		return s.AdoptCalendarAlignmentInMemory(ctx, handlers.BudgetUsageResetOwner{Kind: msg.OwnerKind, ID: msg.OwnerID}, msg.IDs, msg.RateLimits)
+		if err := s.AdoptCalendarAlignmentInMemory(ctx, handlers.BudgetUsageResetOwner{Kind: msg.OwnerKind, ID: msg.OwnerID}, msg.IDs, msg.RateLimits); err != nil {
+			return err
+		}
+		o.counters.onAdopt(msg.IDs, msg.RateLimits)
+		return nil
 	default:
 		return fmt.Errorf("unknown kind %q", msg.Kind)
 	}
@@ -853,7 +874,7 @@ func newOSSyncCollector(o *OSSync) *ossyncCollector {
 		return ossyncMetric{desc: prometheus.NewDesc("bifrost_ossync_"+name, help, nil, labels), kind: kind, value: value}
 	}
 	gauge, counter := prometheus.GaugeValue, prometheus.CounterValue
-	return &ossyncCollector{o: o, metrics: []ossyncMetric{
+	metrics := []ossyncMetric{
 		m("listener_connected", "1 while this node's LISTEN connection is up.", gauge,
 			func(o *OSSync) float64 { return boolMetric(&o.listening) }),
 		m("listener_verified", "1 once this node has received its own NOTIFY ping on the current connection.", gauge,
@@ -889,7 +910,25 @@ func newOSSyncCollector(o *OSSync) *ossyncCollector {
 			func(o *OSSync) float64 { return float64(o.stats.SweepRepairs.Load()) }),
 		m("last_applied_timestamp_seconds", "Unix time of the last notification applied from another node (0 if none).", gauge,
 			func(o *OSSync) float64 { return float64(o.stats.LastAppliedUnix.Load()) }),
-	}}
+	}
+	if o.counters != nil {
+		cs := o.counters
+		metrics = append(metrics,
+			m("counter_limits", "Budget and rate-limit windows counter sync is tracking.", gauge,
+				func(*OSSync) float64 { return float64(cs.stats.Limits.Load()) }),
+			m("counter_last_tick_timestamp_seconds", "Unix time of counter sync's last completed tick (0 if none).", gauge,
+				func(*OSSync) float64 { return float64(cs.stats.LastTickUnix.Load()) }),
+			m("counter_folds_total", "Times another replica's usage was added to this node's counters.", counter,
+				func(*OSSync) float64 { return float64(cs.stats.Folds.Load()) }),
+			m("counter_seeds_total", "Windows seeded with usage recorded before counter sync saw them.", counter,
+				func(*OSSync) float64 { return float64(cs.stats.Seeds.Load()) }),
+			m("counter_write_errors_total", "Failed writes of this node's usage or a reset epoch.", counter,
+				func(*OSSync) float64 { return float64(cs.stats.WriteErrors.Load()) }),
+			m("counter_read_errors_total", "Failed reads of other replicas' usage; folding waits for a good read.", counter,
+				func(*OSSync) float64 { return float64(cs.stats.ReadErrors.Load()) }),
+		)
+	}
+	return &ossyncCollector{o: o, metrics: metrics}
 }
 
 func (c *ossyncCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -1030,7 +1069,10 @@ func (c *ossyncCallbacks) RemoveModelConfig(ctx context.Context, id string) erro
 func (c *ossyncCallbacks) ResetBudgetUsageInMemory(ctx context.Context, owner handlers.BudgetUsageResetOwner, budgetIDs []string) error {
 	err := c.BifrostHTTPServer.ResetBudgetUsageInMemory(ctx, owner, budgetIDs)
 	if err == nil {
-		c.sync.publishBudgets(ossyncKindBudgetReset, owner, budgetIDs, nil)
+		// The epoch orders this reset against usage every replica wrote before it.
+		epoch := time.Now().UnixNano()
+		c.sync.counters.onReset(ctx, compactIDs(budgetIDs), epoch, true, true)
+		c.sync.publishBudgets(ossyncKindBudgetReset, owner, budgetIDs, nil, epoch)
 	}
 	return err
 }
@@ -1038,7 +1080,8 @@ func (c *ossyncCallbacks) ResetBudgetUsageInMemory(ctx context.Context, owner ha
 func (c *ossyncCallbacks) AdoptCalendarAlignmentInMemory(ctx context.Context, owner handlers.BudgetUsageResetOwner, budgetIDs []string, rateLimitIDs []string) error {
 	err := c.BifrostHTTPServer.AdoptCalendarAlignmentInMemory(ctx, owner, budgetIDs, rateLimitIDs)
 	if err == nil {
-		c.sync.publishBudgets(ossyncKindCalendarAlign, owner, budgetIDs, rateLimitIDs)
+		c.sync.counters.onAdopt(budgetIDs, rateLimitIDs)
+		c.sync.publishBudgets(ossyncKindCalendarAlign, owner, budgetIDs, rateLimitIDs, 0)
 	}
 	return err
 }

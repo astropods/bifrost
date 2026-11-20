@@ -11,7 +11,7 @@ Bifrost OSS keeps virtual keys, budgets and rate limits in each node's memory an
 What the fork adds, all behind flags so it behaves like upstream when they are off:
 
 - **Virtual key sync** (`BIFROST_OSS_SYNC=1`): changes made on any node reach every node within milliseconds, with catch-up and reconcile loops for missed notifications.
-- **Counter sync** (planned): budgets and rate limits shared across nodes instead of counted per node.
+- **Counter sync** (`BIFROST_OSS_SYNC_COUNTERS=1`): budget and rate-limit usage shared across nodes, so a limit holds for the cluster instead of per node, within about one second.
 - **Our plugins** (planned): compiled into the gateway rather than loaded as `.so` files.
 
 Background and design: the [architecture page](https://claude.ai/artifact/9RL3YSsRbLSPmeP9UF1c8A).
@@ -99,11 +99,11 @@ The first release goes to preview once step 2 merges and astro bumps `modules/bi
 | 1. Set up the fork | `main` from upstream, default branch, Actions disabled, image built by astro CI (astropods/astro#3796, #3800); branch protection on `main` still to add | astro CI pushes a `v…-ast.…` image for a submodule bump | In progress |
 | 2. Virtual key sync | `feat/oss-vk-sync` PR; sync health exported as Prometheus metrics | A key made on one node works on all nodes within 1 s, no restarts | In progress |
 | 3. Harden sync | Budget resets, gap-aware catch-up, full reconcile and a sweep for teams, customers and model configs (in #1); a Postgres failover on preview | A failover on preview leaves every node consistent | In progress |
-| 4. Counter sync | Shared budgets and rate limits; `replace` lines in `transports/go.mod`; release-script check that our patch is in the binary | A $100 budget across 3 nodes stops at $100 plus at most 1 s of traffic | Not started |
+| 4. Counter sync | Shared budget and rate-limit usage through an own-usage table, no governance plugin change (`feat/oss-counter-sync`) | A limit across replicas stops at the limit plus at most 1 s of traffic | In progress |
 | 5. Our plugins | Compiled into the fork | Plugins ship in the standard image | Not started |
 | 6. First upstream sync | Merge the next `transports/v2.x` release | Tagged and running in staging | Not started |
 
-Step 2 status: [astropods/bifrost#1](https://github.com/astropods/bifrost/pull/1) is open against `main` and next goes to preview for testing. Provider configuration, virtual MCPs and live usage counters are not synced.
+Step 2 status: [astropods/bifrost#1](https://github.com/astropods/bifrost/pull/1) is merged and goes to preview for testing. Provider configuration and virtual MCPs are not synced. Live usage counters are shared only with counter sync (step 4).
 
 ## One-time setup
 
